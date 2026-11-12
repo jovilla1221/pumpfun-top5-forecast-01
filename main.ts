@@ -1,37 +1,28 @@
 // SPDX-License-Identifier: MIT
-// pumpfun-top5-forecast-01 entry: a horizon-aware trajectory forecast.
+// pumpfun-top5-forecast-01 entry, v2: a calibrated Monte Carlo trajectory
+// forecast (the v1 Plackett-Luce model is kept as a 25% blend component).
 //
-// The house baseline assumes the last mark's chart persists. This entry instead
-// models the forecast as what the scorer actually averages: a mixture over the
-// seven answer reads, each at its own distance from the cut.
+// Why Monte Carlo: the score is the mean over seven answer reads of the log
+// probability given to whatever actually holds each place and each size bin.
+// That is a statement about the marginal distribution of the top-5 order
+// statistics at each read, and a simulation estimates exactly those
+// marginals — including per-coin volatility differences, heavy-tailed
+// pump/dump steps, coins dying, and synthetic newcomers (coins born after
+// the cut, or born before it but never ranked in the history's top 200)
+// taking places that no history mint can be named for.
 //
-//   - Every coin's log10(market cap in SOL) is tracked across all marks; a
-//     recency-weighted slope is extrapolated to EACH answer read with
-//     exponential damping (a 10-minute burst is not compounded for hours),
-//     with small adjustments for venue (graduated pool coins persist better
-//     than curve coins), liquidity depth, volatility and stale age.
-//   - Place probabilities come from a Plackett-Luce cascade per read, with a
-//     temperature that widens with that read's horizon, averaged over reads.
-//   - An unnamed share per place, growing with the horizon and with the place,
-//     covers the winners no history can name: coins born after the cut and
-//     coins that were born before it but never ranked in the history's top
-//     200. In the practice rehearsal the last read's places 1, 4 and 5 were
-//     held by mints absent from the history.
-//   - The remaining rows of each place (max 100) are filled with tiny
-//     probabilities for mid-tier coins and p = 0 rows aimed at "zombie chart
-//     survivors" — graduated, older, momentum-dead coins that are likely to
-//     still sit on the answer chart (and so dilute the unnamed share) but
-//     have almost no chance of a top-5 place. Excluding them concentrates
-//     the unnamed share on survivors and newcomers.
-//   - Each place's size is projected per read from that rank's own cap
-//     trajectory (an order statistic of the whole cohort, not one coin),
-//     blended with a logarithmic cohort-growth drift, with a spread that
-//     widens with the horizon, narrows from place 1 to place 5, and carries
-//     a fat right tail for a new super-runner.
+// Calibration comes from the history itself, at runtime:
+//   - the pooled distribution of standardised per-step log-cap changes of
+//     every coin across every mark (heavy tails included), used as the
+//     bootstrap step distribution;
+//   - each coin's recency-weighted, shrunk slope as its step drift, decaying
+//     over the horizon, and its residual volatility as a step-scale factor;
+//   - a newcomer generator whose location tracks the projected place-1 cap,
+//     so its strength follows the market's own trajectory.
 //
-// All times come from task.json (t0, history_until, reads); nothing about the
-// practice or final dates is hardcoded. No randomness, no clock, no network:
-// two runs on the same input produce byte-identical output.
+// A seeded PRNG (mulberry32) and fixed simulation counts make two runs on
+// the same input byte-identical. All times come from task.json. No network,
+// no clock, Node 22 standard library only.
 //
 // Outside the grader's container, MAKEFUN_INPUT_DIR and MAKEFUN_OUTPUT_DIR
 // stand in for /input and /output:
@@ -44,6 +35,20 @@ const INPUT_DIR = process.env.MAKEFUN_INPUT_DIR ?? '/input';
 const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 const HOUR = 3_600_000;
 const MICRO = 1_000_000;
+
+// ---- Monte Carlo knobs (tuned on practice backtests + the official board) --
+const SIMS = 4000;             // simulations per answer read
+const STEPS = 12;              // path steps between the cut and each read
+const NEW_DRAWS = 3;           // synthetic newcomer champion draws per simulation (their maximum is what matters)
+const NEW2_DRAWS = 4;          // synthetic challenger draws: mid-tier newcomers competing for places 3-5
+const NEW2_OFF = 0.3;          // challenger Gumbel location = projected place-4/5 log cap minus this
+const NEW_OFF = 0.45;          // newcomer champion Gumbel location = projected place-1 log cap minus this
+const NEW_SCALE = 0.30;        // newcomer champion Gumbel scale, in log10 SOL
+const JUMP_P = 0.05;           // chance a step is amplified into a jump
+const JUMP_MULT = 2.2;
+const DRIFT_TAU = 3.5;         // hours over which a coin's drift decays
+const BLEND_PL = 0.25;         // weight of the v1 Plackett-Luce component
+const ROW_MIN_P = 0.0008;      // smallest named probability kept as a row
 
 interface Row {
   rank: number;
@@ -85,22 +90,20 @@ const lastMark = marks[marks.length - 1]!;
 if (lastMark.rows.length < places) throw new Error('the last mark ranks fewer coins than the places scored');
 
 // ---- time geometry, all derived from task.json ----------------------------
-const markT = marks.map((m) => (m.atMs - cutMs) / HOUR); // hours relative to the cut, <= ~0
+const markT = marks.map((m) => (m.atMs - cutMs) / HOUR);
 const spanH = Math.max(0.05, markT[markT.length - 1]! - markT[0]!);
-const histH = Math.max(0.25, (cutMs - t0Ms) / HOUR); // opening to cut: 1h practice, 11h final
+const histH = Math.max(0.25, (cutMs - t0Ms) / HOUR);
 const readH = (readMs.length > 0 ? readMs : [cutMs + HOUR]).map((r) => Math.max(0, (r - cutMs) / HOUR));
 const hMid = readH.reduce((a, b) => a + b, 0) / readH.length;
 const sqrtH = Math.sqrt(Math.max(0.05, hMid));
 
-/** log10 of a cap in SOL, as the scorer takes it: log10(lamports) - 9. */
 const sizeOf = (lamports: string | number): number => Math.log10(Number(BigInt(lamports))) - 9;
 const clamp = (x: number, lo: number, hi: number): number => Math.min(hi, Math.max(lo, x));
 
-// ---- recency-weighted linear fit of y against t (hours) --------------------
-function fit(points: Array<{ t: number; y: number }>, halfLifeH: number): { slope: number; lastFit: number; residSd: number } {
-  if (points.length === 0) return { slope: 0, lastFit: 0, residSd: 0 };
+// ---- recency-weighted linear fit -------------------------------------------
+function fit(points: Array<{ t: number; y: number }>, halfLifeH: number): { slope: number; residSd: number } {
+  if (points.length < 2) return { slope: 0, residSd: 0 };
   const tRef = points[points.length - 1]!.t;
-  if (points.length === 1) return { slope: 0, lastFit: points[0]!.y, residSd: 0 };
   let sw = 0, st = 0, sy = 0;
   const ws = points.map((p) => {
     const w = Math.pow(0.5, Math.max(0, tRef - p.t) / halfLifeH);
@@ -113,11 +116,11 @@ function fit(points: Array<{ t: number; y: number }>, halfLifeH: number): { slop
   const slope = den > 1e-9 ? num / den : 0;
   let rv = 0;
   points.forEach((p, i) => { const r = p.y - (my + slope * (p.t - mt)); rv += ws[i]! * r * r; });
-  return { slope, lastFit: my + slope * (tRef - mt), residSd: Math.sqrt(rv / sw) };
+  return { slope, residSd: Math.sqrt(rv / sw) };
 }
 const slopeHalfLife = clamp(spanH / 3, 0.2, 1.5);
 
-// ---- per-coin trajectories --------------------------------------------------
+// ---- per-coin trajectories ---------------------------------------------------
 interface Coin {
   mint: string;
   points: Array<{ t: number; y: number; rank: number }>;
@@ -164,23 +167,18 @@ marks.forEach((m, mi) => {
   }
 });
 
-// Damped extrapolation: a slope is trusted for ~tau hours, then flattens.
-const TAU_DRIFT = 2.0;
-const dampAt = (h: number): number => TAU_DRIFT * (1 - Math.exp(-h / TAU_DRIFT));
+const TAU_DRIFT_PL = 2.0;
+const dampAt = (h: number): number => TAU_DRIFT_PL * (1 - Math.exp(-h / TAU_DRIFT_PL));
 let leaderLog = -Infinity;
-for (const c of byMint.values()) if (c.inLastMark) leaderLog = Math.max(leaderLog, c.lastLog);
+let floorLog = Infinity;
+for (const c of byMint.values()) if (c.inLastMark) { leaderLog = Math.max(leaderLog, c.lastLog); floorLog = Math.min(floorLog, c.lastLog); }
 for (const c of byMint.values()) {
   const f = fit(c.points, slopeHalfLife);
   const shrink = c.points.length / (c.points.length + 3);
   c.slope = clamp(f.slope * shrink, -2, 2);
   c.vol = clamp(f.residSd, 0, 0.6);
   const driftMid = clamp(c.slope * dampAt(hMid), -0.7, 0.45);
-  // No coin is projected far above the current leader's level: a burst that
-  // has not yet reached the top rarely vaults straight past it.
   c.projMid = Math.min(c.lastLog + driftMid, leaderLog + 0.3);
-  // Strength adjustments in log10 units: graduated coins persist, deeper
-  // liquidity persists, wild or stale coins fade. All deliberately small
-  // next to the cap level itself.
   let adj = 0;
   if (c.venue === 'pool') adj += 0.05;
   else if (c.venue === 'migrating') adj += 0.02;
@@ -192,14 +190,13 @@ for (const c of byMint.values()) {
   adj -= 0.18 * Math.max(0, c.vol - 0.15);
   const ageH = Math.max(0, (cutMs - c.createdMs) / HOUR);
   if (ageH > 2 && driftMid <= 0.02) adj -= 0.06;
-  if (c.mayhem && c.venue === 'pool') adj += 0.02; // priced on double supply once pooled
+  if (c.mayhem && c.venue === 'pool') adj += 0.02;
   c.adj = adj;
 }
-/** A coin's Plackett-Luce strength (projected log cap + adjustments) at read horizon h. */
 const strengthAt = (c: Coin, h: number): number =>
   Math.min(c.lastLog + clamp(c.slope * dampAt(h), -0.7, 0.45), leaderLog + 0.3) + c.adj;
 
-// ---- place-cap trajectories (for sizes, and place thresholds) ---------------
+// ---- place-cap trajectories ---------------------------------------------------
 const TAU_SIZE = 1.2;
 const dampSizeAt = (h: number): number => TAU_SIZE * (1 - Math.exp(-h / TAU_SIZE));
 const BETA_SIZE = [0.22, 0.18, 0.14, 0.14, 0.14];
@@ -210,7 +207,6 @@ for (let k = 1; k <= places; k++) {
   const f = fit(pts, slopeHalfLife);
   placeSeries.push({ lastY: pts[pts.length - 1]!.y, slope: f.slope, resid: clamp(f.residSd, 0, 0.25) });
 }
-/** Projected log cap of place k at read horizon h, before cross-place ordering. */
 const placeLogAt = (k: number, h: number): number => {
   const s = placeSeries[k - 1]!;
   const driftSlope = clamp(s.slope * dampSizeAt(h), -0.3, 0.35);
@@ -224,16 +220,42 @@ for (let k = 1; k <= places; k++) {
   projPlaceMid.push(proj);
 }
 
-// ---- candidates and per-read Plackett-Luce place probabilities --------------
+// ---- empirical step distribution (bootstrap calibration) ----------------------
+const rawSteps: number[] = [];
+for (const c of byMint.values()) {
+  for (let i = 1; i < c.points.length; i++) {
+    const dt = c.points[i]!.t - c.points[i - 1]!.t;
+    if (dt > 1e-6) rawSteps.push((c.points[i]!.y - c.points[i - 1]!.y) / Math.sqrt(dt));
+  }
+}
+rawSteps.sort((a, b) => a - b);
+const stepMedian = rawSteps.length > 0 ? rawSteps[Math.floor(rawSteps.length / 2)]! : 0;
+let stepSd = 0.35;
+if (rawSteps.length > 4) {
+  const mean = rawSteps.reduce((a, b) => a + b, 0) / rawSteps.length;
+  stepSd = clamp(Math.sqrt(rawSteps.reduce((a, b) => a + (b - mean) * (b - mean), 0) / rawSteps.length), 0.08, 1.2);
+}
+const zTable = rawSteps.map((s) => (s - stepMedian) / stepSd);
+if (zTable.length === 0) zTable.push(0);
+
+// ---- seeded PRNG ----------------------------------------------------------------
+function mulberry32(seed: number): () => number {
+  let a = seed | 0;
+  return () => {
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// ---- Plackett-Luce component (v1 model, kept for the blend) ----------------------
 const place5Log = projPlaceMid[places - 1]!;
-const candidates = [...byMint.values()]
+const plCandidates = [...byMint.values()]
   .filter((c) => (c.inLastMark && c.lastRank <= 70) || c.bestRank <= 25 || c.projMid >= place5Log - 0.9)
   .sort((a, b) => (b.projMid + b.adj) - (a.projMid + a.adj) || (a.mint < b.mint ? -1 : 1))
   .slice(0, 64);
-
-/** One Plackett-Luce cascade: q[i][k] with each place summing to 1 over candidates. */
 function plCascade(weights: number[]): number[][] {
-  const n = weights.length;
   const totalW = weights.reduce((a, b) => a + b, 0);
   const q: number[][] = weights.map(() => new Array<number>(places).fill(0));
   let expectedPlacedW = 0;
@@ -251,48 +273,127 @@ function plCascade(weights: number[]): number[][] {
   }
   return q;
 }
-// Average the cascade over the answer reads, each at its own horizon and
-// temperature: the score is the mean over reads, so the forecast is the
-// mixture over reads, not a single midpoint distribution.
-const pPlace: number[][] = candidates.map(() => new Array<number>(places).fill(0));
+const plP: number[][] = plCandidates.map(() => new Array<number>(places).fill(0));
 for (const h of readH) {
   const temperature = 0.14 + 0.22 * Math.pow(Math.max(0, h), 0.42);
-  const strengths = candidates.map((c) => strengthAt(c, h));
+  const strengths = plCandidates.map((c) => strengthAt(c, h));
   const zMax = Math.max(...strengths);
   const weights = strengths.map((s) => Math.exp((s - zMax) / temperature));
   const q = plCascade(weights);
-  candidates.forEach((_, i) => { for (let k = 0; k < places; k++) pPlace[i]![k] = pPlace[i]![k]! + q[i]![k]! / readH.length; });
+  plCandidates.forEach((_, i) => { for (let k = 0; k < places; k++) plP[i]![k] = plP[i]![k]! + q[i]![k]! / readH.length; });
+}
+const plIndex = new Map(plCandidates.map((c, i) => [c.mint, i]));
+
+// ---- Monte Carlo ------------------------------------------------------------------
+const simCoins = [...byMint.values()]
+  .filter((c) => (c.inLastMark && c.lastRank <= 100) || c.bestRank <= 20 || c.projMid >= place5Log - 1.1)
+  .sort((a, b) => (b.projMid + b.adj) - (a.projMid + a.adj) || (a.mint < b.mint ? -1 : 1))
+  .slice(0, 110);
+const deathLog = floorLog - 0.6;
+const binOf = (logCap: number): number => {
+  if (logCap < edges[0]!) return 0;
+  for (let i = 1; i < edges.length; i++) if (logCap < edges[i]!) return i;
+  return edges.length;
+};
+const occ: number[][] = simCoins.map(() => new Array<number>(places).fill(0));
+const synthOcc = new Array<number>(places).fill(0);
+const sizeHist: number[][] = Array.from({ length: places }, () => new Array<number>(edges.length + 1).fill(0));
+const rand = mulberry32(0x9e3779b9);
+const nSimCoins = simCoins.length;
+const simLog = new Float64Array(nSimCoins);
+const simDead = new Uint8Array(nSimCoins);
+const driftArr = simCoins.map((c) => clamp(c.slope, -1.2, 0.9));
+const sigmaArr = simCoins.map((c) => clamp(0.55 + 1.1 * c.vol, 0.5, 1.7));
+const totalWeight = SIMS * readH.length;
+for (const h of readH) {
+  const dt = h / STEPS;
+  const sqrtDt = Math.sqrt(Math.max(dt, 0));
+  // Newcomers need a little time to be born and graduate (in this market a
+  // curve can complete and a pool can price a coin within about ten
+  // minutes), so their location is damped only briefly after the cut,
+  // counting the gap between the last mark and history_until as head start.
+  const gapH = Math.max(0, (cutMs - lastMark.atMs) / HOUR);
+  const newDamp = 0.35 * Math.exp(-(h + gapH) / 0.25);
+  const newLoc = placeLogAt(1, h) - NEW_OFF - newDamp;
+  for (let s = 0; s < SIMS; s++) {
+    // walk every coin from the cut to this read
+    for (let i = 0; i < nSimCoins; i++) { simLog[i] = simCoins[i]!.lastLog; simDead[i] = 0; }
+    if (h > 0) {
+      for (let step = 0; step < STEPS; step++) {
+        const elapsed = step * dt;
+        const driftDecay = Math.exp(-elapsed / DRIFT_TAU);
+        for (let i = 0; i < nSimCoins; i++) {
+          if (simDead[i] === 1) {
+            if (rand() < 0.03) { simDead[i] = 0; simLog[i] = deathLog + rand() * 0.4; }
+            continue;
+          }
+          let z = zTable[Math.floor(rand() * zTable.length)]!;
+          if (rand() < JUMP_P) z *= JUMP_MULT;
+          simLog[i] = simLog[i]! + driftArr[i]! * dt * driftDecay + stepSd * sigmaArr[i]! * sqrtDt * z;
+          if (simLog[i]! < deathLog) simDead[i] = 1;
+        }
+      }
+    }
+    // newcomers at this read
+    const pool: Array<{ log: number; idx: number }> = [];
+    for (let i = 0; i < nSimCoins; i++) if (simDead[i] === 0) pool.push({ log: simLog[i]!, idx: i });
+    for (let d = 0; d < NEW_DRAWS; d++) {
+      const u = Math.max(1e-12, rand());
+      const g = newLoc + NEW_SCALE * (-Math.log(-Math.log(u)));
+      pool.push({ log: g, idx: -1 });
+    }
+    const chalLoc = 0.5 * (placeLogAt(4, h) + placeLogAt(5, h)) - NEW2_OFF - newDamp;
+    for (let d = 0; d < NEW2_DRAWS; d++) {
+      const u = Math.max(1e-12, rand());
+      const g = chalLoc + NEW_SCALE * (-Math.log(-Math.log(u)));
+      pool.push({ log: g, idx: -1 });
+    }
+    pool.sort((a, b) => b.log - a.log);
+    for (let k = 0; k < places && k < pool.length; k++) {
+      const w = pool[k]!;
+      if (w.idx >= 0) occ[w.idx]![k] = occ[w.idx]![k]! + 1 / totalWeight;
+      else synthOcc[k] = synthOcc[k]! + 1 / totalWeight;
+      sizeHist[k]![binOf(w.log)] = sizeHist[k]![binOf(w.log)]! + 1 / totalWeight;
+    }
+  }
 }
 
-// ---- unnamed share per place: grows with the horizon and the place ----------
-const unnamedBase = 0.36 + 0.42 * (1 - Math.exp(-hMid / 5));
-const unnamedTarget: number[] = [];
-for (let k = 1; k <= places; k++) unnamedTarget.push(clamp(unnamedBase + 0.04 * (k - 1), 0.2, 0.84));
+// ---- blend MC with PL --------------------------------------------------------------
+const simIndex = new Map(simCoins.map((c, i) => [c.mint, i]));
+const pPlace = new Map<string, number[]>();
+const allMints = new Set<string>([...simCoins.map((c) => c.mint), ...plCandidates.map((c) => c.mint)]);
+for (const mint of allMints) {
+  const arr = new Array<number>(places).fill(0);
+  const si = simIndex.get(mint);
+  const pi = plIndex.get(mint);
+  for (let k = 0; k < places; k++) {
+    const mc = si !== undefined ? occ[si]![k]! : 0;
+    const pl = pi !== undefined ? plP[pi]![k]! * (1 - synthOcc[k]!) : 0;
+    arr[k] = (1 - BLEND_PL) * mc + BLEND_PL * pl;
+  }
+  pPlace.set(mint, arr);
+}
 
-// ---- assemble probability rows ----------------------------------------------
+// ---- unnamed: whatever the named rows do not cover ----------------------------------
+const unnamedTarget: number[] = [];
+for (let k = 1; k <= places; k++) {
+  let named = 0;
+  for (const arr of pPlace.values()) if (arr[k - 1]! >= ROW_MIN_P) named += arr[k - 1]!;
+  unnamedTarget.push(clamp(1 - named, 0.05, 0.9));
+}
+
+// ---- assemble probability rows ---------------------------------------------------------
 const probabilities: Array<{ mint: string; place: number; p: number }> = [];
-const candidateMints = new Set(candidates.map((c) => c.mint));
+const namedMints = new Set<string>(pPlace.keys());
 const gapP0 = 1.0 + 0.1 * sqrtH;
 const ageGuardH = Math.min(0.75, 0.45 * histH);
 for (let k = 1; k <= places; k++) {
-  const namedMass = 1 - unnamedTarget[k - 1]!;
-  // Candidate rows: read-averaged PL probabilities scaled to namedMass,
-  // rows below 0.0006 dropped and the kept rows rescaled to namedMass.
   const rows: Array<{ mint: string; p: number }> = [];
-  candidates.forEach((c, i) => {
-    const p = pPlace[i]![k - 1]! * namedMass;
-    if (p >= 0.0006) rows.push({ mint: c.mint, p });
-  });
-  const sumRows = rows.reduce((s, r) => s + r.p, 0);
-  if (sumRows > 0) rows.forEach((r) => { r.p = (r.p / sumRows) * namedMass; });
+  for (const [mint, arr] of pPlace) if (arr[k - 1]! >= ROW_MIN_P) rows.push({ mint, p: arr[k - 1]! });
   let rowCount = rows.length;
   const threshold = projPlaceMid[k - 1]!;
-  // Tiny rows: mid-tier coins (in the last mark, below the candidates) whose
-  // projected cap sits 0.45..gapP0 below this place's projected cap. Naming
-  // them at a small honest p removes them from the unnamed pool while
-  // keeping a real hedge if one of them does break out.
   const mids = [...byMint.values()]
-    .filter((c) => c.inLastMark && !candidateMints.has(c.mint))
+    .filter((c) => c.inLastMark && !namedMints.has(c.mint))
     .map((c) => ({ c, gap: threshold - c.projMid }))
     .filter((x) => x.gap >= 0.45 && x.gap < gapP0 && x.c.slope > -0.5)
     .sort((a, b) => a.gap - b.gap || (a.c.mint < b.c.mint ? -1 : 1))
@@ -303,14 +404,9 @@ for (let k = 1; k <= places; k++) {
     rows.push({ mint: x.c.mint, p: 0.0012 });
     rowCount++;
   }
-  // p = 0 rows, in priority order: zombie chart survivors first (graduated,
-  // older, momentum-dead, still ranked — the coins most likely to be on the
-  // answer chart diluting the unnamed share), then other coins that would
-  // need an extreme surge to hold this place. Fast risers, very volatile
-  // coins and brand-new coins are never excluded: their lottery chance is
-  // real, and a p = 0 that backfires costs far more than an exclusion earns.
+  const inRows = new Set(rows.map((r) => r.mint));
   const eligible = [...byMint.values()]
-    .filter((c) => !candidateMints.has(c.mint) && !midMints.has(c.mint))
+    .filter((c) => !inRows.has(c.mint))
     .map((c) => ({ c, gap: threshold - c.projMid, ageH: Math.max(0, (cutMs - c.createdMs) / HOUR) }))
     .filter((x) => x.gap > gapP0 && x.c.slope <= 0.8 && x.c.vol <= 0.45 && !(x.ageH < 0.35 && x.c.inLastMark));
   const tierOf = (x: (typeof eligible)[number]): number => {
@@ -330,10 +426,10 @@ for (let k = 1; k <= places; k++) {
     .forEach((r) => probabilities.push({ mint: r.mint, place: k, p: Math.round(r.p * MICRO) / MICRO }));
 }
 
-// ---- top5: by expected place score under the model --------------------------
-const scored = candidates.map((c, i) => ({
-  mint: c.mint,
-  s: pPlace[i]!.reduce((sum, p, kk) => sum + p * (places - kk), 0),
+// ---- top5 --------------------------------------------------------------------------------
+const scored = [...pPlace.entries()].map(([mint, arr]) => ({
+  mint,
+  s: arr.reduce((sum, p, kk) => sum + p * (places - kk), 0),
 }));
 scored.sort((a, b) => b.s - a.s || (a.mint < b.mint ? -1 : 1));
 const top5 = scored.slice(0, places).map((x) => x.mint);
@@ -344,7 +440,7 @@ if (top5.length < places) {
   }
 }
 
-// ---- sizes: per-read mixture around each place's projected cap --------------
+// ---- sizes: MC histogram smoothed, blended with the analytic v1 sizes ----------------------
 function erfc(x: number): number {
   const z = Math.abs(x);
   const t = 1 / (1 + 0.5 * z);
@@ -355,23 +451,32 @@ const above = (x: number, mean: number, sd: number): number => (x === -Infinity 
 const PLACE_SD_FACTOR = [1.15, 1.05, 1.0, 0.95, 0.9];
 const sizes: Array<{ place: number; bin: number; p: number }> = [];
 for (let k = 1; k <= places; k++) {
+  // smooth the MC histogram with two passes of a [0.25, 0.5, 0.25] kernel
+  let hist = sizeHist[k - 1]!.slice();
+  for (let pass = 0; pass < 2; pass++) {
+    const next = hist.slice();
+    for (let b = 0; b < hist.length; b++) {
+      const left = b > 0 ? hist[b - 1]! : 0;
+      const right = b < hist.length - 1 ? hist[b + 1]! : 0;
+      next[b] = 0.25 * left + 0.5 * hist[b]! + 0.25 * right;
+    }
+    hist = next;
+  }
   const resid = placeSeries[k - 1]!.resid;
   const sdFactor = PLACE_SD_FACTOR[k - 1] ?? 1;
   for (let bin = 0; bin <= edges.length; bin++) {
     const lo = bin === 0 ? -Infinity : edges[bin - 1]!;
     const hi = bin === edges.length ? Infinity : edges[bin]!;
-    // Average this bin's probability over the answer reads, each read with
-    // its own projected mean and horizon-widened spread.
-    let pMix = 0;
+    let analytic = 0;
     for (const h of readH) {
       let mean = placeLogAt(k, h);
-      // Keep the places ordered at every read.
       if (k > 1) mean = Math.min(mean, placeLogAt(k - 1, h) - 0.015);
       const sd = (0.2 + 0.11 * Math.sqrt(Math.max(0.05, h)) + 1.3 * resid) * sdFactor;
       const body = above(lo, mean, sd) - above(hi, mean, sd);
       const tail = above(lo, mean + 0.4 - 0.05 * (k - 1), Math.max(sd * 1.8, 0.5)) - above(hi, mean + 0.4 - 0.05 * (k - 1), Math.max(sd * 1.8, 0.5));
-      pMix += (0.88 * body + 0.12 * tail) / readH.length;
+      analytic += (0.88 * body + 0.12 * tail) / readH.length;
     }
+    const pMix = 0.85 * hist[bin]! + 0.15 * analytic;
     const u = Math.floor(pMix * MICRO);
     if (u > 0) sizes.push({ place: k, bin, p: u / MICRO });
   }
