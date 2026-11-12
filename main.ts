@@ -297,7 +297,7 @@ const binOf = (logCap: number): number => {
 };
 const occ: number[][] = simCoins.map(() => new Array<number>(places).fill(0));
 const synthOcc = new Array<number>(places).fill(0);
-const sizeHist: number[][] = Array.from({ length: places }, () => new Array<number>(edges.length + 1).fill(0));
+const sizeSamples: number[][] = Array.from({ length: places }, () => [] as number[]);
 const rand = mulberry32(0x9e3779b9);
 const nSimCoins = simCoins.length;
 const simLog = new Float64Array(nSimCoins);
@@ -353,7 +353,7 @@ for (const h of readH) {
       const w = pool[k]!;
       if (w.idx >= 0) occ[w.idx]![k] = occ[w.idx]![k]! + 1 / totalWeight;
       else synthOcc[k] = synthOcc[k]! + 1 / totalWeight;
-      sizeHist[k]![binOf(w.log)] = sizeHist[k]![binOf(w.log)]! + 1 / totalWeight;
+      sizeSamples[k]!.push(w.log);
     }
   }
 }
@@ -438,6 +438,19 @@ if (top5.length < places) {
     if (top5.length >= places) break;
     if (!top5.includes(r.mint)) top5.push(r.mint);
   }
+}
+
+// ---- size histograms from the winner-cap samples, mildly shrunk toward
+// each place's own mean: the raw winner-cap spread overstates the size
+// uncertainty (v2's official size score implies a narrower law around a
+// similar centre), so the width is tightened without moving the centre --
+const SIZE_SHRINK = 0.88;
+const sizeHist: number[][] = Array.from({ length: places }, () => new Array<number>(edges.length + 1).fill(0));
+for (let k = 0; k < places; k++) {
+  const samples = sizeSamples[k]!;
+  if (samples.length === 0) continue;
+  const mean = samples.reduce((a, b) => a + b, 0) / samples.length;
+  for (const x of samples) sizeHist[k]![binOf(mean + (x - mean) * SIZE_SHRINK)] += 1 / totalWeight;
 }
 
 // ---- sizes: MC histogram smoothed, blended with the analytic v1 sizes ----------------------
