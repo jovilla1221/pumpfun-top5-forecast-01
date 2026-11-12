@@ -454,6 +454,14 @@ if (top5.length < places) {
 // narrowed, lifted, or winsorised. The order model is untouched.
 const SIZE_DOWN0 = 0.09;
 const SIZE_FLATTEN = 0.45;
+// Blind-gap bridge (Argon consultation, final round): in the final window
+// the first answer read sits ~7h after the cut, where the exponential term
+// above is dead and the flatten term anchors to a first read whose mean is
+// itself inflated by the whole blind gap. This extra term restores a
+// down-shift of the same total magnitude that won the practice window. It
+// is exactly zero for every read at h <= 1.2, so practice-window behaviour
+// is byte-identical to v5.
+const SIZE_GAP_DOSE = 0.17;
 const sizeHist: number[][] = Array.from({ length: places }, () => new Array<number>(edges.length + 1).fill(0));
 for (let k = 0; k < places; k++) {
   const first = sizeSamplesByRead[0]![k]!;
@@ -462,7 +470,8 @@ for (let k = 0; k < places; k++) {
     const samples = sizeSamplesByRead[ri]![k]!;
     if (samples.length === 0) continue;
     const mr = samples.reduce((a, b) => a + b, 0) / samples.length;
-    const adj = -SIZE_DOWN0 * Math.exp(-readH[ri]! / 0.6) - SIZE_FLATTEN * (mr - m0);
+    const adj = -SIZE_DOWN0 * Math.exp(-readH[ri]! / 0.6) - SIZE_FLATTEN * (mr - m0)
+      - SIZE_GAP_DOSE * (1 - Math.exp(-Math.max(0, readH[ri]! - 1.2) / 2.5));
     for (const x of samples) sizeHist[k]![binOf(x + adj)] += 1 / totalWeight;
   }
 }
