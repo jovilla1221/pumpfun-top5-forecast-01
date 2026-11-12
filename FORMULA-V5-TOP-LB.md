@@ -4,6 +4,8 @@ Dokumen eksperimen untuk @yo-lo / tim Rereh, 12 Nov 2026.
 Kode v5 PERSIS sudah ada di repo ini: `main.ts` pada commit `747d9b95`
 (round 6) dan commit `d912895d` (round 8, restore; isi identik).
 Submission round 8 `01a1ce47` adalah entri yang berlaku.
+UPDATE 12 Nov 2026 malam: round 8 sudah DIGANTIKAN submission #10 (varian
+jembatan v5 + suku blind-gap) sebagai entri final — lihat `FINAL-ENTRY-V7-BRIDGE.md`.
 Skor practice RESMI v5: total **-33,152723** (order -18,749426, size -14,403296,
 agreement 62) — peringkat 5-7 dari ±390, zona berbayar (top 10).
 
