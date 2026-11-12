@@ -16,7 +16,7 @@ supaya eksperimen lanjutan bisa dimulai dari titik terbaik, bukan dari nol.
   deterministik byte-identik, runtime ±4 detik.
 - Langkah harga: **bootstrap distribusi empiris** perubahan log-cap SEMUA koin
   di history (ekor tebal asli dipertahankan; jangan diganti distribusi parametrik).
-- Drift: slope log-cap per koin, **dire dam / meluruh** seiring horizon.
+- Drift: slope log-cap per koin, **diredam dan meluruh** seiring horizon.
 - Koin bisa **mati** di dalam lintasan.
 - Generator pendatang baru **dua lapis**:
   - champion: lahir di dekat proyeksi cap place-1,
