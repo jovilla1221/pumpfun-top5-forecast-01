@@ -452,8 +452,8 @@ if (top5.length < places) {
 // horizon) and flattens half of the simulated upward ramp across reads.
 // Within-read shapes and widths are preserved exactly; nothing is
 // narrowed, lifted, or winsorised. The order model is untouched.
-const SIZE_DOWN0 = 0.135;
-const SIZE_FLATTEN = 0.675;
+const SIZE_DOWN0 = 0.09;
+const SIZE_FLATTEN = 0.45;
 const sizeHist: number[][] = Array.from({ length: places }, () => new Array<number>(edges.length + 1).fill(0));
 for (let k = 0; k < places; k++) {
   const first = sizeSamplesByRead[0]![k]!;
