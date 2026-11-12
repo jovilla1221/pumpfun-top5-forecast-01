@@ -274,8 +274,7 @@ function plCascade(weights: number[]): number[][] {
   return q;
 }
 const plP: number[][] = plCandidates.map(() => new Array<number>(places).fill(0));
-for (let ri = 0; ri < readH.length; ri++) {
-  const h = readH[ri]!;
+for (const h of readH) {
   const temperature = 0.14 + 0.22 * Math.pow(Math.max(0, h), 0.42);
   const strengths = plCandidates.map((c) => strengthAt(c, h));
   const zMax = Math.max(...strengths);
@@ -298,7 +297,7 @@ const binOf = (logCap: number): number => {
 };
 const occ: number[][] = simCoins.map(() => new Array<number>(places).fill(0));
 const synthOcc = new Array<number>(places).fill(0);
-const sizeSamplesByRead: number[][][] = readH.map(() => Array.from({ length: places }, () => [] as number[]));
+const sizeHist: number[][] = Array.from({ length: places }, () => new Array<number>(edges.length + 1).fill(0));
 const rand = mulberry32(0x9e3779b9);
 const nSimCoins = simCoins.length;
 const simLog = new Float64Array(nSimCoins);
@@ -306,8 +305,7 @@ const simDead = new Uint8Array(nSimCoins);
 const driftArr = simCoins.map((c) => clamp(c.slope, -1.2, 0.9));
 const sigmaArr = simCoins.map((c) => clamp(0.55 + 1.1 * c.vol, 0.5, 1.7));
 const totalWeight = SIMS * readH.length;
-for (let ri = 0; ri < readH.length; ri++) {
-  const h = readH[ri]!;
+for (const h of readH) {
   const dt = h / STEPS;
   const sqrtDt = Math.sqrt(Math.max(dt, 0));
   // Newcomers need a little time to be born and graduate (in this market a
@@ -355,7 +353,7 @@ for (let ri = 0; ri < readH.length; ri++) {
       const w = pool[k]!;
       if (w.idx >= 0) occ[w.idx]![k] = occ[w.idx]![k]! + 1 / totalWeight;
       else synthOcc[k] = synthOcc[k]! + 1 / totalWeight;
-      sizeSamplesByRead[ri]![k]!.push(w.log);
+      sizeHist[k]![binOf(w.log)] = sizeHist[k]![binOf(w.log)]! + 1 / totalWeight;
     }
   }
 }
@@ -442,26 +440,6 @@ if (top5.length < places) {
   }
 }
 
-// ---- size histograms from the winner-cap samples -------------------------
-// Diagnosis from v2's official result and per-read sample means: simulated
-// winner caps ramp up roughly +0.4 over the answer hour, but real caps jump
-// early (a graduation prices a coin near its place within minutes) and then
-// flatten. So each read's samples are lifted by an amount that decays with
-// the horizon, and runaway samples are winsorised against the place
-// trajectory. Within-read shapes and the order model are untouched.
-const SIZE_LIFT = 0.12;
-const sizeHist: number[][] = Array.from({ length: places }, () => new Array<number>(edges.length + 1).fill(0));
-for (let ri = 0; ri < readH.length; ri++) {
-  const h = readH[ri]!;
-  const lift = SIZE_LIFT * Math.exp(-h / 0.5);
-  for (let k = 0; k < places; k++) {
-    const cap = placeLogAt(k + 1, h) + 0.6;
-    for (const x of sizeSamplesByRead[ri]![k]!) {
-      sizeHist[k]![binOf(Math.min(x + lift, cap))] += 1 / totalWeight;
-    }
-  }
-}
-
 // ---- sizes: MC histogram smoothed, blended with the analytic v1 sizes ----------------------
 function erfc(x: number): number {
   const z = Math.abs(x);
@@ -490,8 +468,7 @@ for (let k = 1; k <= places; k++) {
     const lo = bin === 0 ? -Infinity : edges[bin - 1]!;
     const hi = bin === edges.length ? Infinity : edges[bin]!;
     let analytic = 0;
-    for (let ri = 0; ri < readH.length; ri++) {
-  const h = readH[ri]!;
+    for (const h of readH) {
       let mean = placeLogAt(k, h);
       if (k > 1) mean = Math.min(mean, placeLogAt(k - 1, h) - 0.015);
       const sd = (0.2 + 0.11 * Math.sqrt(Math.max(0.05, h)) + 1.3 * resid) * sdFactor;
